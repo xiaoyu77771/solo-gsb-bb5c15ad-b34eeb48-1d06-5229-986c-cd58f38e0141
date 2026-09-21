@@ -161,5 +161,92 @@ def test_analysis_404s(client):
     assert client.get("/sites/1/analysis").status_code == 404  # 尚未分析
 
 
+# ---------------------------------------------------------------- 风险组
+
+def test_risk_groups_merge_multi_source_same_frequency(client):
+    # 载频 [100, 300, 400]：违规产物 200{(300,400)} 与 500{(300,100),(400,300)}
+    # 同频产物 500 的多来源合并到同一节点，并经共享载频与 200 归为一组
+    client.post("/sites", json=make_payload())
+    analysis_id = client.post("/sites/1/analysis").json()["analysis_id"]
+
+    resp = client.get(f"/analyses/{analysis_id}/risk-groups")
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == [
+        {
+            "group_id": 1,
+            "carriers_hz": [100, 300, 400],
+            "product_freqs_hz": [200, 500],
+            "source_pair_count": 3,  # 500 的两个来源组合都计入
+            "distance_hz": 100,  # min(100, 100)
+        }
+    ]
+
+
+def test_risk_groups_chain_shared_carriers_and_exclude_non_violating(client):
+    # 载频 [100, 200, 400, 1000, 1100]，guard_interval=250：
+    # 违规产物 300{200,100}(d=100)、600{400,200}(d=200) 经共享载频 200 链式归组；
+    # 900{1000,1100}、1200{1100,1000} 为另一组。
+    # 非违规产物 700{400,100}、1800{(1000,200),(1100,400)} 等不参与，
+    # 否则两组会被桥接合并。
+    payload = make_payload(carriers_hz=[100, 200, 400, 1000, 1100], guard_interval_hz=250)
+    client.post("/sites", json=payload)
+    analysis_id = client.post("/sites/1/analysis").json()["analysis_id"]
+
+    resp = client.get(f"/analyses/{analysis_id}/risk-groups")
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == [
+        {  # 按最小载频排序：100 < 1000，group_id 自 1 连续编号
+            "group_id": 1,
+            "carriers_hz": [100, 200, 400],
+            "product_freqs_hz": [300, 600],
+            "source_pair_count": 2,
+            "distance_hz": 100,  # min(100, 200)
+        },
+        {
+            "group_id": 2,
+            "carriers_hz": [1000, 1100],
+            "product_freqs_hz": [900, 1200],
+            "source_pair_count": 2,
+            "distance_hz": 100,
+        },
+    ]
+
+
+def test_risk_groups_empty_when_no_violation(client):
+    # guard_interval_hz=0：任何产物都不违规，返回空列表
+    client.post("/sites", json=make_payload(guard_interval_hz=0))
+    analysis_id = client.post("/sites/1/analysis").json()["analysis_id"]
+    resp = client.get(f"/analyses/{analysis_id}/risk-groups")
+    assert resp.status_code == 200
+    assert resp.json() == []
+
+
+def test_risk_groups_use_persisted_result(client):
+    # 风险组基于已持久化的分析结果：同一 analysis_id 多次查询结果稳定一致
+    payload = make_payload(
+        carriers_hz=[1000, 1100],
+        guard_bands=[{"start_hz": 880, "end_hz": 920}],
+        guard_interval_hz=50,
+    )
+    client.post("/sites", json=payload)
+    analysis_id = client.post("/sites/1/analysis").json()["analysis_id"]
+
+    expected = [
+        {  # 仅 900（落在保护频段内，距离 0）违规；1200 不违规不参与
+            "group_id": 1,
+            "carriers_hz": [1000, 1100],
+            "product_freqs_hz": [900],
+            "source_pair_count": 1,
+            "distance_hz": 0,
+        }
+    ]
+    assert client.get(f"/analyses/{analysis_id}/risk-groups").json() == expected
+    assert client.get(f"/analyses/{analysis_id}/risk-groups").json() == expected
+
+
+def test_risk_groups_404(client):
+    assert client.get("/analyses/999/risk-groups").status_code == 404
+
+
 def test_health(client):
     assert client.get("/health").json() == {"status": "ok"}

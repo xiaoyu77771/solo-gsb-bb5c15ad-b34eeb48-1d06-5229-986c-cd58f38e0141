@@ -37,6 +37,18 @@ docker compose up --build
 - **保护间隔**：`violates_guard_interval = (distance_hz < guard_interval_hz)`，
   即产物到命中对象的间距小于保护间隔时判定为违规。
 - **排序**：结果按产物频率升序；同频产物已聚合，频率唯一，排序稳定确定。
+- **风险组**（`GET /analyses/{analysis_id}/risk-groups`）：仅使用已持久化的分析结果，
+  不重新计算。每个违规产物（`violates_guard_interval = true`）视为一个风险节点，
+  并将其全部来源组合中的 `fa_hz`、`fb_hz` 载频与该节点连边，构成“产物–载频”二部图；
+  连通分量即风险组——共享载频会传递归组，同频产物的多来源合并到同一节点，
+  非违规产物不参与构图。每组返回：
+  - `group_id`：组排序后自 1 连续编号；
+  - `carriers_hz`：组内全部载频，升序；
+  - `product_freqs_hz`：组内违规产物频率，升序；
+  - `source_pair_count`：组内来源组合 `(fa, fb)` 总数；
+  - `distance_hz`：组内产物的最小 `distance_hz`。
+
+  组按最小载频再按最小产物频率排序；分析不存在返回 `404`，无违规产物时返回空列表 `[]`。
 
 ## 校验规则（整批拒绝）
 
@@ -59,6 +71,7 @@ docker compose up --build
 | `GET` | `/sites/{site_id}/analysis` | 查询该方案最近一次分析结果 |
 | `GET` | `/sites/{site_id}/analyses` | 列出该方案的全部分析记录 |
 | `GET` | `/analyses/{analysis_id}` | 按 id 查询已保存的分析结果 |
+| `GET` | `/analyses/{analysis_id}/risk-groups` | 按已保存分析结果生成风险组（违规产物二部图连通分量） |
 
 ### 示例
 
@@ -81,6 +94,9 @@ curl -X POST http://localhost:8000/sites/1/analysis
 # 查询已保存的方案与分析结果
 curl http://localhost:8000/sites/1
 curl http://localhost:8000/sites/1/analysis
+
+# 生成风险组（基于已保存的分析结果，违规产物 + 来源载频的连通分量）
+curl http://localhost:8000/analyses/1/risk-groups
 ```
 
 分析响应节选：
@@ -103,13 +119,27 @@ curl http://localhost:8000/sites/1/analysis
 }
 ```
 
+风险组响应示例（同上方案：违规产物 200 与 500 经共享载频归为一组，700 不违规不参与）：
+
+```json
+[
+  {
+    "group_id": 1,
+    "carriers_hz": [100, 300, 400],
+    "product_freqs_hz": [200, 500],
+    "source_pair_count": 3,
+    "distance_hz": 0
+  }
+]
+```
+
 ## 本地开发（不用 Docker）
 
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements-dev.txt
 
-# 运行测试（13 个用例，覆盖创建、校验拒绝、聚合、距离、持久化查询）
+# 运行测试（18 个用例，覆盖创建、校验拒绝、聚合、距离、持久化查询、风险组归组）
 pytest
 
 # 启动服务，API 位于 http://127.0.0.1:8000
@@ -127,7 +157,7 @@ uvicorn app.main:app --reload
 ```
 app/
   main.py       # FastAPI 应用与路由，启动时初始化数据库
-  analysis.py   # 三阶互调枚举、同频聚合、最近命中对象计算
+  analysis.py   # 三阶互调枚举、同频聚合、最近命中对象计算、风险组构建
   database.py   # SQLite 建表与读写（单事务批量写入）
   schemas.py    # Pydantic 请求/响应模型与校验
 tests/

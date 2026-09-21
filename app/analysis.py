@@ -1,7 +1,7 @@
 """三阶互调产物分析：枚举 2*fa - fb，聚合来源并评估最近命中对象。"""
 from __future__ import annotations
 
-from .schemas import GuardBand, HitObject, ProductOut, SourcePair
+from .schemas import GuardBand, HitObject, ProductOut, RiskGroup, SourcePair
 
 
 def enumerate_third_order_products(
@@ -87,3 +87,73 @@ def analyze(
             )
         )
     return results
+
+
+def build_risk_groups(products: list[ProductOut]) -> list[RiskGroup]:
+    """由已持久化的分析结果构建风险组（纯读取，不重新计算分析）。
+
+    仅违规产物（violates_guard_interval）作为风险节点参与构图；每个风险节点
+    与其全部来源组合中的 fa_hz、fb_hz 载频连边，形成“产物-载频”二部图，
+    连通分量即风险组（共享载频传递归组）。同频产物的多来源合并到同一节点，
+    非违规产物不参与。组按最小载频再按最小产物频率排序，group_id 自 1 连续编号。
+    """
+    # 同频合并：持久化结果本已按频率聚合，此处防御性再合并一次
+    merged: dict[int, dict] = {}
+    for p in products:
+        if not p.violates_guard_interval:
+            continue
+        node = merged.setdefault(p.freq_hz, {"distance_hz": p.distance_hz, "sources": []})
+        node["distance_hz"] = min(node["distance_hz"], p.distance_hz)
+        node["sources"].extend(p.sources)
+
+    # 并查集：节点为 ("p", 产物频率) 或 ("c", 载频)
+    parent: dict[tuple[str, int], tuple[str, int]] = {}
+
+    def find(x: tuple[str, int]) -> tuple[str, int]:
+        root = x
+        while parent[root] != root:
+            root = parent[root]
+        while parent[x] != root:  # 路径压缩
+            parent[x], x = root, parent[x]
+        return root
+
+    def link(a: tuple[str, int], b: tuple[str, int]) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    for freq, node in merged.items():
+        pnode = ("p", freq)
+        parent.setdefault(pnode, pnode)
+        for s in node["sources"]:
+            for carrier in (s.fa_hz, s.fb_hz):
+                cnode = ("c", carrier)
+                parent.setdefault(cnode, cnode)
+                link(pnode, cnode)
+
+    # 汇总连通分量：每个分量至少含一个产物节点，载频由产物节点的边带来
+    comps: dict[tuple[str, int], dict] = {}
+    for freq, node in merged.items():
+        comp = comps.setdefault(
+            find(("p", freq)),
+            {"carriers": set(), "freqs": [], "pairs": 0, "distance_hz": node["distance_hz"]},
+        )
+        comp["freqs"].append(freq)
+        comp["pairs"] += len(node["sources"])
+        comp["distance_hz"] = min(comp["distance_hz"], node["distance_hz"])
+    for key in parent:
+        if key[0] == "c":
+            comps[find(key)]["carriers"].add(key[1])
+
+    groups = [
+        {
+            "carriers_hz": sorted(c["carriers"]),
+            "product_freqs_hz": sorted(c["freqs"]),
+            "source_pair_count": c["pairs"],
+            "distance_hz": c["distance_hz"],
+        }
+        for c in comps.values()
+    ]
+    # 产物存在必有来源，故每组载频非空；按最小载频再按最小产物频率排序
+    groups.sort(key=lambda g: (g["carriers_hz"][0], g["product_freqs_hz"][0]))
+    return [RiskGroup(group_id=i, **g) for i, g in enumerate(groups, start=1)]
