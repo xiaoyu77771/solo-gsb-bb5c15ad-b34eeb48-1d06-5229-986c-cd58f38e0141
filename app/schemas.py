@@ -98,3 +98,13 @@ class AnalysisMeta(BaseModel):
     site_id: int
     created_at: str
     product_count: int
+
+
+class RiskGroup(BaseModel):
+    """一个风险组：违规产物与其来源载频构成二部图后的一个连通分量。"""
+
+    group_id: int = Field(..., description="组编号：按 (最小载频, 最小产物频率) 排序后从 1 连续编号")
+    carriers_hz: list[int] = Field(..., description="组内全部来源载频（fa_hz/fb_hz），升序")
+    product_freqs_hz: list[int] = Field(..., description="组内违规产物频率，升序")
+    source_pair_count: int = Field(..., description="组内全部产物的来源组合总数")
+    distance_hz: int = Field(..., description="组内产物到命中对象的最小距离")

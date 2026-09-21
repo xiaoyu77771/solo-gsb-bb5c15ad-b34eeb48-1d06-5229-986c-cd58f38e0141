@@ -1,7 +1,7 @@
 """三阶互调产物分析：枚举 2*fa - fb，聚合来源并评估最近命中对象。"""
 from __future__ import annotations
 
-from .schemas import GuardBand, HitObject, ProductOut, SourcePair
+from .schemas import GuardBand, HitObject, ProductOut, RiskGroup, SourcePair
 
 
 def enumerate_third_order_products(
@@ -87,3 +87,66 @@ def analyze(
             )
         )
     return results
+
+
+def build_risk_groups(products: list[ProductOut]) -> list[RiskGroup]:
+    """由已持久化的分析结果生成风险组（二部图连通分量）。
+
+    仅 violates_guard_interval 的违规产物参与：每个违规产物是一个风险节点，
+    其全部来源组合中的载频 fa_hz/fb_hz 与该节点连边，构成二部图；每个连通
+    分量即一个风险组。同频产物的多来源已聚合在同一节点，共享载频的产物沿
+    链式边传递归组；非违规产物不参与，不会桥接任何载频。
+    组按 (最小载频, 最小产物频率) 升序排序，group_id 从 1 连续编号。
+    """
+    violating = [p for p in products if p.violates_guard_interval]
+    if not violating:
+        return []
+
+    # 并查集：节点为 ("product", freq_hz) 或 ("carrier", carrier_hz)，
+    # 两类节点分开编号，避免产物频率与载频数值相同而混淆。
+    parent: dict[tuple[str, int], tuple[str, int]] = {}
+
+    def find(node: tuple[str, int]) -> tuple[str, int]:
+        while parent[node] != node:
+            parent[node] = parent[parent[node]]  # 路径压缩
+            node = parent[node]
+        return node
+
+    def link(a: tuple[str, int], b: tuple[str, int]) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[max(ra, rb)] = min(ra, rb)
+
+    for product in violating:
+        pnode = ("product", product.freq_hz)
+        parent.setdefault(pnode, pnode)
+        for source in product.sources:
+            for carrier_hz in (source.fa_hz, source.fb_hz):
+                cnode = ("carrier", carrier_hz)
+                parent.setdefault(cnode, cnode)
+                link(pnode, cnode)
+
+    components: dict[tuple[str, int], dict[str, set[int]]] = {}
+    for node in list(parent):
+        kind, value = node
+        bucket = components.setdefault(find(node), {"product": set(), "carrier": set()})
+        bucket[kind].add(value)
+
+    by_freq = {p.freq_hz: p for p in violating}
+    groups: list[RiskGroup] = []
+    for bucket in components.values():
+        members = [by_freq[f] for f in bucket["product"]]
+        groups.append(
+            RiskGroup(
+                group_id=0,  # 占位，排序后统一编号
+                carriers_hz=sorted(bucket["carrier"]),
+                product_freqs_hz=sorted(bucket["product"]),
+                source_pair_count=sum(len(p.sources) for p in members),
+                distance_hz=min(p.distance_hz for p in members),
+            )
+        )
+    # 各组载频集合互不相交，排序键唯一，编号稳定确定
+    groups.sort(key=lambda g: (g.carriers_hz[0], g.product_freqs_hz[0]))
+    for group_id, group in enumerate(groups, start=1):
+        group.group_id = group_id
+    return groups

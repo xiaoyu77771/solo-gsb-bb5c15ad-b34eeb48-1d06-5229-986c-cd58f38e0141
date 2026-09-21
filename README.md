@@ -38,6 +38,21 @@ docker compose up --build
   即产物到命中对象的间距小于保护间隔时判定为违规。
 - **排序**：结果按产物频率升序；同频产物已聚合，频率唯一，排序稳定确定。
 
+## 风险分组（risk groups）
+
+`GET /analyses/{analysis_id}/risk-groups` 仅基于**已持久化**的分析结果计算，不重新扫描：
+
+- **风险节点**：每个 `violates_guard_interval = true` 的违规产物是一个节点；
+  非违规产物不参与（不会把不同簇桥接起来）。
+- **连边**：节点的全部来源组合 `(fa_hz, fb_hz)` 中的载频都与该节点相连，
+  构成"产物 ↔ 载频"二部图；同频产物的多来源已聚合在同一节点。
+- **归组**：二部图的每个连通分量即一个风险组——共享载频的产物沿链式边传递归组。
+- **每组字段**：`carriers_hz`（升序）、`product_freqs_hz`（升序）、
+  `source_pair_count`（组内来源组合总数）、`distance_hz`（组内最小距离）。
+- **稳定编号**：组按 `(最小载频, 最小产物频率)` 升序排序后，`group_id` 从 1 连续编号；
+  各组载频集合互不相交，排序键唯一，编号稳定可复现。
+- 分析不存在 → `404`；无违规产物 → `200` 返回空列表 `[]`。
+
 ## 校验规则（整批拒绝）
 
 - 载频必须为正整数 Hz 且**不得重复**；至少 1 个载频。
@@ -59,6 +74,7 @@ docker compose up --build
 | `GET` | `/sites/{site_id}/analysis` | 查询该方案最近一次分析结果 |
 | `GET` | `/sites/{site_id}/analyses` | 列出该方案的全部分析记录 |
 | `GET` | `/analyses/{analysis_id}` | 按 id 查询已保存的分析结果 |
+| `GET` | `/analyses/{analysis_id}/risk-groups` | 按已保存分析结果生成风险分组（违规产物 ↔ 来源载频的二部图连通分量） |
 
 ### 示例
 
@@ -81,6 +97,9 @@ curl -X POST http://localhost:8000/sites/1/analysis
 # 查询已保存的方案与分析结果
 curl http://localhost:8000/sites/1
 curl http://localhost:8000/sites/1/analysis
+
+# 查询风险分组（违规产物与来源载频的连通分量）
+curl http://localhost:8000/analyses/1/risk-groups
 ```
 
 分析响应节选：
@@ -103,13 +122,27 @@ curl http://localhost:8000/sites/1/analysis
 }
 ```
 
+风险分组响应示例（上例中违规产物 200 与 500 共享载频 300/400，归为一组）：
+
+```json
+[
+  {
+    "group_id": 1,
+    "carriers_hz": [100, 300, 400],
+    "product_freqs_hz": [200, 500],
+    "source_pair_count": 3,
+    "distance_hz": 0
+  }
+]
+```
+
 ## 本地开发（不用 Docker）
 
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements-dev.txt
 
-# 运行测试（13 个用例，覆盖创建、校验拒绝、聚合、距离、持久化查询）
+# 运行测试（19 个用例，覆盖创建、校验拒绝、聚合、距离、持久化查询、风险分组）
 pytest
 
 # 启动服务，API 位于 http://127.0.0.1:8000
@@ -127,7 +160,7 @@ uvicorn app.main:app --reload
 ```
 app/
   main.py       # FastAPI 应用与路由，启动时初始化数据库
-  analysis.py   # 三阶互调枚举、同频聚合、最近命中对象计算
+  analysis.py   # 三阶互调枚举、同频聚合、最近命中对象计算、风险分组（连通分量）
   database.py   # SQLite 建表与读写（单事务批量写入）
   schemas.py    # Pydantic 请求/响应模型与校验
 tests/

@@ -7,8 +7,8 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, status
 
 from . import database
-from .analysis import analyze
-from .schemas import AnalysisMeta, AnalysisResult, SiteCreate, SiteOut
+from .analysis import analyze, build_risk_groups
+from .schemas import AnalysisMeta, AnalysisResult, RiskGroup, SiteCreate, SiteOut
 
 
 @asynccontextmanager
@@ -132,3 +132,21 @@ def get_analysis(analysis_id: int) -> AnalysisResult:
     if result is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, f"analysis {analysis_id} not found")
     return result
+
+
+@app.get(
+    "/analyses/{analysis_id}/risk-groups",
+    response_model=list[RiskGroup],
+    tags=["analysis"],
+    summary="按已保存分析结果生成风险分组（违规产物与来源载频的二部图连通分量）",
+    description=(
+        "仅使用已持久化的分析结果：每个违规产物为一个风险节点，其全部来源组合中的 "
+        "fa_hz/fb_hz 载频与该节点连边，按连通分量归组；非违规产物不参与。"
+        "无违规产物时返回空列表。"
+    ),
+)
+def get_risk_groups(analysis_id: int) -> list[RiskGroup]:
+    result = database.fetch_analysis(analysis_id)
+    if result is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, f"analysis {analysis_id} not found")
+    return build_risk_groups(result.products)

@@ -161,5 +161,101 @@ def test_analysis_404s(client):
     assert client.get("/sites/1/analysis").status_code == 404  # 尚未分析
 
 
+# ---------------------------------------------------------------- 风险分组
+
+def test_risk_groups_404(client):
+    assert client.get("/analyses/999/risk-groups").status_code == 404
+
+
+def test_risk_groups_empty_when_no_violation(client):
+    # guard_interval_hz=0：distance < 0 永不成立，无违规产物 -> 空列表
+    client.post("/sites", json=make_payload(guard_interval_hz=0))
+    analysis_id = client.post("/sites/1/analysis").json()["analysis_id"]
+    resp = client.get(f"/analyses/{analysis_id}/risk-groups")
+    assert resp.status_code == 200
+    assert resp.json() == []
+
+
+def test_risk_groups_merge_multi_source_and_shared_carriers(client):
+    # 载频 [100, 300, 400]：违规产物 200（来源 (300,400)）与 500（来源 (300,100)、
+    # (400,300)，同频已合并）共享载频 300/400，归为一组；非违规的 700 不参与
+    client.post("/sites", json=make_payload())
+    analysis_id = client.post("/sites/1/analysis").json()["analysis_id"]
+    resp = client.get(f"/analyses/{analysis_id}/risk-groups")
+    assert resp.status_code == 200
+    assert resp.json() == [
+        {
+            "group_id": 1,
+            "carriers_hz": [100, 300, 400],
+            "product_freqs_hz": [200, 500],
+            "source_pair_count": 3,  # 200 有 1 个来源，500 有 2 个来源
+            "distance_hz": 100,  # min(100, 100)
+        }
+    ]
+
+
+def test_risk_groups_split_disjoint_components(client):
+    # 两簇载频各产生违规产物；非违规产物 9900（来源含载频 100 与 5000）
+    # 不参与分组，不得把两簇桥接成一组
+    payload = make_payload(
+        carriers_hz=[100, 200, 5000, 6000],
+        scan_start_hz=1,
+        scan_end_hz=100000,
+        guard_interval_hz=1100,
+    )
+    client.post("/sites", json=payload)
+    analysis_id = client.post("/sites/1/analysis").json()["analysis_id"]
+    groups = client.get(f"/analyses/{analysis_id}/risk-groups").json()
+    assert groups == [
+        {
+            "group_id": 1,
+            "carriers_hz": [100, 200],
+            "product_freqs_hz": [300],
+            "source_pair_count": 1,
+            "distance_hz": 100,
+        },
+        {
+            "group_id": 2,
+            "carriers_hz": [5000, 6000],
+            "product_freqs_hz": [4000, 7000],
+            "source_pair_count": 2,
+            "distance_hz": 1000,
+        },
+    ]
+
+
+def test_risk_groups_transitive_carrier_sharing(client):
+    # 300 的载频 {100,200} 与 1200 的 {400,800} 不直接共享，
+    # 仅经 600/700 链式共享载频传递归为一组
+    payload = make_payload(
+        carriers_hz=[100, 200, 400, 800],
+        scan_start_hz=1,
+        scan_end_hz=2000,
+        guard_interval_hz=450,
+    )
+    client.post("/sites", json=payload)
+    analysis_id = client.post("/sites/1/analysis").json()["analysis_id"]
+    groups = client.get(f"/analyses/{analysis_id}/risk-groups").json()
+    assert groups == [
+        {
+            "group_id": 1,
+            "carriers_hz": [100, 200, 400, 800],
+            "product_freqs_hz": [300, 600, 700, 1200],
+            "source_pair_count": 4,
+            "distance_hz": 100,
+        }
+    ]
+
+
+def test_risk_groups_use_persisted_result(client):
+    # 分组基于已持久化的分析结果：同一 analysis_id 重复查询结果一致
+    client.post("/sites", json=make_payload())
+    analysis_id = client.post("/sites/1/analysis").json()["analysis_id"]
+    first = client.get(f"/analyses/{analysis_id}/risk-groups").json()
+    second = client.get(f"/analyses/{analysis_id}/risk-groups").json()
+    assert first == second
+    assert [g["group_id"] for g in first] == list(range(1, len(first) + 1))
+
+
 def test_health(client):
     assert client.get("/health").json() == {"status": "ok"}
